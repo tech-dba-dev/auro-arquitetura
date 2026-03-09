@@ -60,7 +60,9 @@ WHERE user_id != current_user
   AND user_id NOT IN (blocked_by_me)
   AND user_id NOT IN (blocked_me)
   AND user_id NOT IN (active_matches)       -- already matched & chatting
+  AND user_id NOT IN (blocked_users)        -- blocked (either direction)
   AND gender_orientation_passes(me, them)    -- Phase 1 filter from compatibility
+  AND relationship_type_compatible(me, them)  -- Phase 1 filter (v2.0)
   AND hard_deal_breakers_pass(me, them)      -- Phase 1 filter
   AND onboarding_complete = true
   AND account_active = true
@@ -415,7 +417,25 @@ IF A liked B AND B liked A:
 active      → Both users can chat
 archived    → One user archived (hidden but not deleted)
 unmatched   → One user unmatched (chat deleted for both)
+couple      → Both users activated Couple Mode together (Dating Mode match graduated)
+blocked     → One user blocked the other (permanent, mutual, no recovery)
 ```
+
+> **Change v2.0:** Added `couple` state (match graduates when both activate Couple Mode) and `blocked` state (stronger than `unmatched` — no recycling, no recovery).
+
+### Auto-archive logic (new in v2.0):
+```
+IF match.created_at < now() - interval '30 days'
+   AND last_message_at IS NULL           -- never sent a message
+→ auto-archive (state = 'archived')
+
+IF match.created_at < now() - interval '90 days'
+   AND last_message_at < now() - interval '60 days'  -- inactive for 60 days
+→ auto-archive (state = 'archived')
+```
+
+Archived matches are hidden from the main list but accessible via an "archived" tab. Users are notified before archiving via push notification ("Heads up — your match with {name} will be archived in 7 days").
+
 
 ---
 
@@ -457,7 +477,7 @@ What gets sent to the client for each swipe card:
   "photos": ["url1", "url2"],
   "bio": "Short personality line or interest hint",
   "compatibility_score": 92,
-  "compatibility_label": "A strong connection!",
+  "compatibility_label": "Rare Connection",
   "distance_km": 3.2,
   "slot_type": "high_match",
 
@@ -493,7 +513,7 @@ What gets sent to the client for each swipe card:
     "explanation": {
       "strengths": "You share emotional depth and similar outlooks on relationships.",
       "complements": "Your MBTIs are highly complementary...",
-      "attention": "Different exercise habits..."
+      "worth_exploring": "Different exercise habits..."
     },
     "score_breakdown": {
       "love": 88,
@@ -557,4 +577,4 @@ What gets sent to the client for each swipe card:
 
 ---
 
-*This document evolves as the project grows. Last updated: 2026-03-01*
+*This document evolves as the project grows. Last updated: 2026-03-09 — v2.0 (couple/blocked states, auto-archive, relationship type Phase 1 filter)*

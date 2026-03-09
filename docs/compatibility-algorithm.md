@@ -1,6 +1,6 @@
 # Compatibility Algorithm Architecture
 
-> Status: **Work in progress** — structure is defined, details being refined each iteration.
+> Status: **v2.0** — updated March 2026. Relationship type moved to Phase 1 filter; Attachment Style added to Block 3; score labels revised.
 
 ## Overview
 
@@ -45,7 +45,26 @@ ELSE → ELIMINATED (never appears)
 - `non_binary` and `gender_fluid` → treated as their own gender categories, not as "everyone"
 - Check is **always bidirectional** — both must accept
 
-### Filter 2: Hard Deal Breakers
+### Filter 2: Relationship Type Compatibility
+
+Bidirectional check. Incompatible relationship intentions are eliminated before scoring.
+
+```
+INCOMPATIBLE_PAIRS = [
+  ("long_term", "open_relation"),
+  ("long_term", "casual"),
+  ("monogamous", "polyamorous"),
+]
+
+IF (A.relationship_type, B.relationship_type) IN INCOMPATIBLE_PAIRS (either direction)
+→ ELIMINATED
+
+ELSE → PASS
+```
+
+> **Change from v1:** Relationship type was a Phase 2 penalty (-20 to -40 pts). It is now a Phase 1 hard filter. Fundamentally incompatible intentions should not generate matches at all.
+
+### Filter 3: Hard Deal Breakers
 
 The AI has already processed the user's free text into structured JSON. This phase reads **only items where the AI determined high severity**.
 
@@ -67,13 +86,7 @@ FOR EACH deal_breaker IN A.deal_breakers_json:
 
 Penalties are **deducted from the final score** after the 4 blocks are calculated. They don't eliminate, they reduce.
 
-### Penalty: Relationship Type Mismatch
-| Scenario | Penalty |
-|----------|---------|
-| `long_term` vs `open_relation` | -30 to -40 |
-| `monogamous` vs `polyamorous` | -30 to -40 |
-| `casual` vs `long_term` | -20 to -30 |
-| Same type | 0 |
+> **Note v2.0:** Relationship type mismatch is no longer a penalty — it was promoted to a Phase 1 hard filter. Only genuine soft mismatches remain as penalties.
 
 ### Penalty: Medium Deal Breakers
 Items from `deal_breakers_json` where severity is "medium". These are near-misses — the user doesn't want it, but it's not a hard no.
@@ -160,12 +173,26 @@ score_lifestyle = weighted_average(smoking×15, drinking×15, exercise×20, diet
 
 ### Block 3: Values & Personality — 25% of total
 
+> **Change v2.0:** Attachment Style added (25%). MBTI weight reduced from 30% → 15%. Politics and Religion each reduced from 25% → 20%. Situation unchanged at 20%.
+
 | Sub-field | Weight | Scoring Logic |
 |-----------|--------|---------------|
-| MBTI | 30% | Known complementary pairs = 90, same type = 70, neutral = 50, friction pairs = 20 |
-| Political views | 25% | Same = 100, different + both open = 60, different + one closed = 25, both closed = 0 |
-| Religion | 25% | Same = 100, different with tolerance = 55, opposite without tolerance = 10 |
+| Attachment Style | 25% | Compatibility matrix based on secure/anxious/avoidant/fearful_avoidant pairs |
+| Political views | 20% | Same = 100, different + both open = 60, different + one closed = 25, both closed = 0 |
+| Religion | 20% | Same = 100, different with tolerance = 55, opposite without tolerance = 10 |
 | Situation + Area | 20% | Same situation + similar area = 100, same situation diff area = 60, diff situation = 40 |
+| MBTI | 15% | Known complementary pairs = 90, same type = 70, neutral = 50, friction pairs = 20 |
+
+#### Attachment Style Compatibility Matrix:
+
+| A \ B | Secure | Anxious | Avoidant | Fearful-Avoidant |
+|-------|--------|---------|----------|-----------------|
+| Secure | 100 | 75 | 65 | 55 |
+| Anxious | 75 | 50 | 20 | 30 |
+| Avoidant | 65 | 20 | 60 | 25 |
+| Fearful-Avoidant | 55 | 30 | 25 | 40 |
+
+> Rationale: Secure attachment is the most adaptive — it pairs well with all types. Anxious + Avoidant is the most problematic pairing (pursuer-distancer dynamic).
 
 #### MBTI Known Pairs (examples, not exhaustive):
 - Complementary: INFJ-ENFP, INTJ-ENTP, INFP-ENFJ
@@ -173,7 +200,7 @@ score_lifestyle = weighted_average(smoking×15, drinking×15, exercise×20, diet
 
 #### Block 3 formula:
 ```
-score_values = (mbti×0.30) + (politics×0.25) + (religion×0.25) + (situation×0.20)
+score_values = (attachment×0.25) + (politics×0.20) + (religion×0.20) + (situation×0.20) + (mbti×0.15)
 ```
 
 ---
@@ -305,9 +332,11 @@ Output:
 {
   "strengths": "You both share Physical Touch as your love language and value humor and intelligence...",
   "complements": "Your MBTIs (INFJ and ENFP) are one of the most complementary pairs...",
-  "attention": "Different political views — but you're both open to dating someone with a different perspective."
+  "worth_exploring": "Different political views — but you're both open to dating someone with a different perspective."
 }
 ```
+
+> **Change v2.0:** Key renamed from `"attention"` → `"worth_exploring"`. Framing is now explicitly positive — it's an invitation to explore, not a warning.
 
 Rules for AI #2:
 - Friendly, personal language
@@ -319,13 +348,15 @@ Rules for AI #2:
 
 ## Score Display
 
+> **Change v2.0:** Labels revised to be friendlier and less discouraging. "Unlikely" replaced with "Worth a Conversation" — every match shown to the user passed Phases 1 and 2 and deserves consideration.
+
 | Range | Label | Description |
 |-------|-------|-------------|
 | 85–100 | Rare Connection | Exceptional match in almost every aspect |
-| 70–84 | High Compatibility | Strong affinity with few divergences |
-| 50–69 | Compatible with Differences | Solid base with attention points |
-| 30–49 | Few Things in Common | Significant differences in most aspects |
-| 0–29 | Unlikely | Very divergent profiles |
+| 70–84 | Strong Compatibility | Deep affinity with few divergences |
+| 50–69 | Good Match | Solid base with points worth exploring |
+| 30–49 | Interesting Differences | Different perspectives that could complement |
+| 0–29 | Worth a Conversation | Divergent profiles — sometimes opposites surprise you |
 
 ---
 
@@ -338,6 +369,7 @@ Rules for AI #2:
 | Calculated scores | `compatibility_scores` | Cached, invalidated (`is_stale`) when either profile changes |
 | AI explanations | `compatibility_scores.explanation` | Cached with scores |
 | Algorithm weights | `compatibility_weights` | Admin-configurable, no deploy needed |
+| Algorithm version | `compatibility_scores.scoring_version` | Tracks which algorithm version generated the score (e.g. `"2.0"`) — allows selective invalidation when algorithm changes |
 
 ---
 
@@ -353,4 +385,4 @@ Rules for AI #2:
 
 ---
 
-*This document evolves as the project grows. Last updated: 2026-02-28*
+*This document evolves as the project grows. Last updated: 2026-03-09 — v2.0*

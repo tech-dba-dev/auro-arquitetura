@@ -152,6 +152,47 @@ Users can retake MBTI and Love Language tests within the app.
 
 ---
 
+### Step 10: Attachment Style *(New — v2.0)*
+**Screen:** "How do you connect in relationships?"
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| attachment_style | enum | yes | `secure`, `anxious`, `avoidant`, `fearful_avoidant` |
+
+Users answer a short quiz (4–6 questions). The app calculates the style from responses. Result is shown with a brief, empathetic explanation of what it means.
+
+**Table:** `user_personality`
+
+> **Why collect this:** Attachment Style is the highest-impact new variable in Block 3 (25% weight). Research shows it's highly predictive of relationship dynamics.
+
+---
+
+### Step 11: Emotional Readiness *(New — v2.0)*
+**Screen:** "Where are you emotionally?"
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| emotional_readiness | enum | yes | `ready`, `almost_ready`, `taking_it_slow`, `just_exploring` |
+
+Simple single-choice step. No quiz. Used to contextualize other compatibility factors and set expectations.
+
+**Table:** `user_personality`
+
+---
+
+### Step 12: Communication Style *(New — v2.0)*
+**Screen:** "How do you communicate?"
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| communication_style | enum | yes | `direct`, `indirect`, `empathetic`, `analytical` |
+
+4-option chip selection. Feeds into match explanation copy and AI conversation context.
+
+**Table:** `user_personality`
+
+---
+
 ## Data Model Summary
 
 ```
@@ -166,7 +207,8 @@ profiles                        -- Core identity (name, birthdate, gender, orien
   |     |-- preferences_json    -- AI-structured preferences
   |-- user_habits               -- Smoking, drinking, exercise, diet
   |-- user_values               -- Hobbies, religion, politics, situation
-  |-- user_personality          -- MBTI, love languages
+  |-- user_personality          -- MBTI, love languages, attachment_style (v2.0),
+  |                             --   emotional_readiness (v2.0), communication_style (v2.0)
   |-- user_photos               -- Profile images (up to 6, ordered by position)
   |-- onboarding_progress       -- Tracks steps + profile completion (filled_fields / total_fields)
   |
@@ -230,7 +272,7 @@ All onboarding fields are editable from the profile settings screen. The edit pr
 | **About Relationships** | `user_relationship_prefs` | relationship_type, has_kids, who_to_see, dating_style, attraction_factors, deal_breakers, preferences |
 | **Personal Habits** | `user_habits` | smokes, drinks, exercises, exercise_types, diet, online_availability |
 | **Values & Lifestyle** | `user_values` | hobbies, religion, politics, situation |
-| **Personality** | `user_personality` | MBTI (retake test), Love Language (retake test) |
+| **Personality** | `user_personality` | MBTI (retake test), Love Language (retake test), Attachment Style (retake quiz), Emotional Readiness, Communication Style |
 | **Zodiac** | `user_astrology` | birth_location, birth_time (recalculates chart) |
 
 > **Important:** Editing any field that feeds the compatibility algorithm triggers `is_stale = true` on all cached `compatibility_scores` involving this user.
@@ -270,10 +312,10 @@ Every profile field feeds into the **3-phase compatibility pipeline**:
 
 ### Phase 1: Filters (eliminate before scoring)
 - Gender/orientation cross-check (bidirectional)
+- **Relationship type incompatibility** — hard filter v2.0 (was Phase 2 penalty)
 - Hard deal breakers from AI-processed JSON
 
 ### Phase 2: Penalties (deduct from score)
-- Relationship type mismatch (-30 to -40)
 - Medium deal breakers from AI-processed JSON (-15 to -40)
 - Preference mismatches (configurable)
 
@@ -281,7 +323,8 @@ Every profile field feeds into the **3-phase compatibility pipeline**:
 ```
 Block 1: Love (35%)           -- love_language + attraction_factors
 Block 2: Lifestyle (25%)      -- smokes, drinks, exercises, diet, hobbies, availability
-Block 3: Values (25%)         -- MBTI, politics, religion, situation
+Block 3: Values (25%)         -- attachment_style (25%), politics (20%), religion (20%),
+                              --   situation (20%), MBTI (15%)  [v2.0 weights]
 Block 4: Astrology (15%)      -- sun sign (always) or full chart (if available)
 
 score_final = max(0, score_bruto - penalties)
@@ -296,4 +339,4 @@ score_final = max(0, score_bruto - penalties)
 
 ---
 
-*This document evolves as the project grows. Last updated: 2026-03-01*
+*This document evolves as the project grows. Last updated: 2026-03-09 — v2.0 (Steps 10–12 added: Attachment Style, Emotional Readiness, Communication Style)*

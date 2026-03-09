@@ -1,8 +1,9 @@
 -- ============================================================
 -- AURO - Supabase SQL Schema
 -- Module: Onboarding & Profile + Compatibility + Matching + Chat
--- Version: 4.0
--- Last updated: 2026-03-01
+-- Version: 2.0 (was 4.0 — renamed to align with architecture versioning)
+-- Last updated: 2026-03-09
+-- v2.0 changes appended at the bottom of this file
 -- ============================================================
 -- Run this in Supabase SQL Editor (or via migrations)
 -- Depends on: Supabase Auth (auth.users), PostGIS extension
@@ -1384,3 +1385,705 @@ INSERT INTO matching_config (key, value, description) VALUES
     "accelerated_cooldown_days": 14,
     "emergency_cooldown_days": 7
   }', 'How the system handles running out of profiles in a region');
+
+
+-- ============================================================
+-- ============================================================
+-- SCHEMA v2.0 ADDITIONS
+-- March 2026
+-- ============================================================
+-- Sections:
+--   1. New ENUMs
+--   2. ALTER TABLE (existing tables — new columns)
+--   3. RLS fixes (bugs found in v1)
+--   4. New tables: Couple Mode (10)
+--   5. New tables: Notifications (3)
+--   6. New tables: Ritual Library (2)
+--   7. New table: feature_config
+--   8. New indexes
+--   9. RLS for new tables
+--  10. Updated seed data (compatibility_weights v2.0)
+--  11. feature_config seed data
+--  12. pg_cron data retention jobs
+-- ============================================================
+
+
+-- ============================================================
+-- 1. NEW ENUMS
+-- ============================================================
+
+CREATE TYPE attachment_style_type AS ENUM (
+  'secure',
+  'anxious',
+  'avoidant',
+  'fearful_avoidant'
+);
+
+CREATE TYPE emotional_readiness_type AS ENUM (
+  'ready',
+  'almost_ready',
+  'taking_it_slow',
+  'just_exploring'
+);
+
+CREATE TYPE communication_style_type AS ENUM (
+  'direct',
+  'indirect',
+  'empathetic',
+  'analytical'
+);
+
+-- Extended match status (was TEXT in original, now includes couple + blocked)
+-- Note: if matches.status is already TEXT CHECK, just update the CHECK constraint.
+-- If it was an ENUM, create and alter:
+CREATE TYPE match_status_type AS ENUM (
+  'active',
+  'archived',
+  'unmatched',
+  'couple',
+  'blocked'
+);
+
+
+-- ============================================================
+-- 2. ALTER TABLE — existing tables, new columns
+-- ============================================================
+
+-- profiles: mode flags (replaces sole reliance on user_modes join)
+ALTER TABLE profiles
+  ADD COLUMN IF NOT EXISTS is_dating  BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS is_couple  BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_wedding BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_life    BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;   -- soft delete
+
+-- user_personality: 3 new fields from Steps 10–12
+ALTER TABLE user_personality
+  ADD COLUMN IF NOT EXISTS attachment_style     attachment_style_type,
+  ADD COLUMN IF NOT EXISTS emotional_readiness  emotional_readiness_type,
+  ADD COLUMN IF NOT EXISTS communication_style  communication_style_type;
+
+-- compatibility_scores: track which algorithm version generated the score
+ALTER TABLE compatibility_scores
+  ADD COLUMN IF NOT EXISTS scoring_version TEXT NOT NULL DEFAULT '1.0';
+
+-- matches: extend status to include couple + blocked
+-- If status is TEXT with CHECK constraint, update it:
+ALTER TABLE matches DROP CONSTRAINT IF EXISTS matches_status_check;
+ALTER TABLE matches
+  ADD CONSTRAINT matches_status_check
+  CHECK (status IN ('active', 'archived', 'unmatched', 'couple', 'blocked'));
+
+-- Add auto-archive metadata
+ALTER TABLE matches
+  ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ;
+
+
+-- ============================================================
+-- 3. RLS FIXES (bugs from v1 identified in security audit)
+-- ============================================================
+
+-- BUG 1: profiles SELECT USING (true) — exposes all profiles to all authenticated users
+-- Fix: restrict to own profile + mutual matches
+DROP POLICY IF EXISTS "Profiles are viewable by all authenticated users" ON profiles;
+
+CREATE POLICY "profiles_select_v2"
+  ON profiles FOR SELECT TO authenticated
+  USING (
+    id = auth.uid()
+    OR id IN (
+      SELECT CASE
+        WHEN user_a = auth.uid() THEN user_b
+        ELSE user_a
+      END
+      FROM matches
+      WHERE (user_a = auth.uid() OR user_b = auth.uid())
+        AND status IN ('active', 'couple')
+    )
+  );
+
+-- BUG 2: user_photos INSERT from client — bypasses CSAM detection
+-- Fix: remove client INSERT. All uploads go through Edge Function (upload-photo).
+DROP POLICY IF EXISTS "Users can upload their own photos" ON user_photos;
+DROP POLICY IF EXISTS "Photos are viewable by all authenticated users" ON user_photos;
+
+-- Photos SELECT: same restriction as profiles (match participants only)
+CREATE POLICY "photos_select_v2"
+  ON user_photos FOR SELECT TO authenticated
+  USING (
+    user_id = auth.uid()
+    OR user_id IN (
+      SELECT CASE
+        WHEN user_a = auth.uid() THEN user_b
+        ELSE user_a
+      END
+      FROM matches
+      WHERE (user_a = auth.uid() OR user_b = auth.uid())
+        AND status IN ('active', 'couple')
+    )
+  );
+-- No INSERT from client. Edge Function uses service_role.
+
+-- BUG 3: matches UPDATE unrestricted — user could change user_a/user_b
+DROP POLICY IF EXISTS "Users can update their own matches" ON matches;
+
+CREATE POLICY "matches_update_status_only"
+  ON matches FOR UPDATE TO authenticated
+  USING (user_a = auth.uid() OR user_b = auth.uid())
+  WITH CHECK (
+    -- Prevent changing who is in the match
+    user_a = (SELECT user_a FROM matches m2 WHERE m2.id = matches.id)
+    AND user_b = (SELECT user_b FROM matches m2 WHERE m2.id = matches.id)
+  );
+
+-- BUG 4: reports — no SELECT policy, reporter can't see own reports
+CREATE POLICY "Users can view their own reports"
+  ON reports FOR SELECT TO authenticated
+  USING (reporter_id = auth.uid());
+
+
+-- ============================================================
+-- 4. NEW TABLES: COUPLE MODE
+-- ============================================================
+
+CREATE TABLE couples (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_a_id         UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  user_b_id         UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  activated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  anniversary_date  DATE,
+  relationship_name TEXT,
+  status            TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'paused', 'ended')),
+  ended_at          TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_a_id, user_b_id)
+);
+
+CREATE TABLE ritual_library (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title       TEXT NOT NULL,
+  description TEXT NOT NULL,
+  ritual_type TEXT NOT NULL CHECK (ritual_type IN ('daily', 'weekly', 'special')),
+  category    TEXT NOT NULL CHECK (category IN (
+                'connection', 'communication', 'adventure',
+                'intimacy', 'growth', 'gratitude'
+              )),
+  tags        TEXT[],
+  is_active   BOOLEAN NOT NULL DEFAULT true,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE ritual_library_used (
+  couple_id  UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  library_id UUID NOT NULL REFERENCES ritual_library(id) ON DELETE CASCADE,
+  shown_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (couple_id, library_id)
+);
+
+CREATE TABLE couple_rituals (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id       UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL,
+  ritual_type     TEXT NOT NULL CHECK (ritual_type IN ('daily', 'weekly', 'special')),
+  category        TEXT NOT NULL CHECK (category IN (
+                    'connection', 'communication', 'adventure',
+                    'intimacy', 'growth', 'gratitude'
+                  )),
+  source          TEXT NOT NULL CHECK (source IN ('ai_generated', 'library', 'user_created')),
+  library_id      UUID REFERENCES ritual_library(id),
+  scheduled_for   DATE,
+  completed_at    TIMESTAMPTZ,
+  completed_by    UUID REFERENCES profiles(id),
+  credits_awarded SMALLINT DEFAULT 0,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE couple_journal_entries (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id   UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  author_id   UUID NOT NULL REFERENCES profiles(id),
+  title       TEXT,
+  content     TEXT NOT NULL,
+  is_shared   BOOLEAN NOT NULL DEFAULT false,
+  mood        TEXT CHECK (mood IN ('joyful','grateful','conflicted','sad','hopeful','neutral')),
+  tags        TEXT[],
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE couple_timeline_events (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id    UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  created_by   UUID NOT NULL REFERENCES profiles(id),
+  event_type   TEXT NOT NULL CHECK (event_type IN (
+                 'milestone', 'memory', 'trip', 'achievement',
+                 'challenge_completed', 'anniversary', 'custom'
+               )),
+  title        TEXT NOT NULL,
+  description  TEXT,
+  event_date   DATE NOT NULL,
+  photo_urls   TEXT[],
+  is_pinned    BOOLEAN NOT NULL DEFAULT false,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE couple_check_ins (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id       UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  user_id         UUID NOT NULL REFERENCES profiles(id),
+  check_in_date   DATE NOT NULL,
+  frequency       TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly')),
+  energy_level    SMALLINT CHECK (energy_level BETWEEN 1 AND 5),
+  connection_feel SMALLINT CHECK (connection_feel BETWEEN 1 AND 5),
+  stress_level    SMALLINT CHECK (stress_level BETWEEN 1 AND 5),
+  highlight       TEXT,
+  needs           TEXT,
+  gratitude       TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (couple_id, user_id, check_in_date, frequency)
+);
+
+CREATE TABLE couple_challenges (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id      UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  title          TEXT NOT NULL,
+  description    TEXT NOT NULL,
+  category       TEXT NOT NULL CHECK (category IN (
+                   'communication', 'intimacy', 'adventure',
+                   'gratitude', 'growth', 'fun'
+                 )),
+  duration_days  SMALLINT NOT NULL DEFAULT 7,
+  started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at   TIMESTAMPTZ,
+  credits_reward SMALLINT NOT NULL DEFAULT 50,
+  status         TEXT NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active', 'completed', 'abandoned')),
+  progress       JSONB DEFAULT '{}',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE couple_credits (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id        UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  user_id          UUID REFERENCES profiles(id),
+  transaction_type TEXT NOT NULL CHECK (transaction_type IN (
+                     'earned_ritual', 'earned_checkin', 'earned_challenge',
+                     'earned_streak', 'earned_milestone',
+                     'spent_ritual_extra', 'spent_insight', 'spent_custom',
+                     'bonus_onboarding', 'admin_adjustment'
+                   )),
+  amount           SMALLINT NOT NULL,
+  balance_after    INT NOT NULL,
+  description      TEXT,
+  reference_id     UUID,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE couple_badges (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id  UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  badge_type TEXT NOT NULL,
+  earned_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (couple_id, badge_type)
+);
+
+CREATE TABLE couple_insights (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id    UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  period_month DATE NOT NULL,
+  title        TEXT NOT NULL,
+  summary      TEXT NOT NULL,
+  strengths    TEXT[],
+  growth_areas TEXT[],
+  suggestion   TEXT,
+  data_points  JSONB,
+  generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  viewed_at    TIMESTAMPTZ,
+  UNIQUE (couple_id, period_month)
+);
+
+
+-- ============================================================
+-- 5. NEW TABLES: NOTIFICATIONS
+-- ============================================================
+
+CREATE TABLE push_tokens (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  token      TEXT NOT NULL,
+  platform   TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+  device_id  TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, device_id)
+);
+
+CREATE TABLE notification_preferences (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE UNIQUE,
+  new_match         BOOLEAN NOT NULL DEFAULT true,
+  new_message       BOOLEAN NOT NULL DEFAULT true,
+  match_expiring    BOOLEAN NOT NULL DEFAULT true,
+  ritual_reminder   BOOLEAN NOT NULL DEFAULT true,
+  check_in_reminder BOOLEAN NOT NULL DEFAULT true,
+  couple_badge      BOOLEAN NOT NULL DEFAULT true,
+  couple_insight    BOOLEAN NOT NULL DEFAULT true,
+  marketing         BOOLEAN NOT NULL DEFAULT false,
+  quiet_hours_start TIME NOT NULL DEFAULT '22:00',
+  quiet_hours_end   TIME NOT NULL DEFAULT '08:00',
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE notification_log (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  notification_type TEXT NOT NULL,
+  category          TEXT NOT NULL,
+  title             TEXT NOT NULL,
+  body              TEXT NOT NULL,
+  deep_link         TEXT,
+  sent_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  delivered_at      TIMESTAMPTZ,
+  tapped_at         TIMESTAMPTZ,
+  status            TEXT NOT NULL DEFAULT 'sent'
+                    CHECK (status IN ('sent', 'delivered', 'tapped', 'failed'))
+);
+
+
+-- ============================================================
+-- 6. NEW TABLE: FEATURE CONFIG
+-- ============================================================
+
+CREATE TABLE feature_config (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  feature_key   TEXT NOT NULL UNIQUE,
+  free_limit    INT,
+  premium_limit INT,
+  unit          TEXT,
+  description   TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- ============================================================
+-- 7. NEW INDEXES
+-- ============================================================
+
+-- profiles v2.0
+CREATE INDEX idx_profiles_mode_dating ON profiles(is_dating) WHERE is_dating = true;
+CREATE INDEX idx_profiles_mode_couple ON profiles(is_couple) WHERE is_couple = true;
+CREATE INDEX idx_profiles_deleted ON profiles(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- personality new fields
+CREATE INDEX idx_personality_attachment ON user_personality(attachment_style);
+
+-- compatibility scores with version
+CREATE INDEX idx_compat_scores_version ON compatibility_scores(scoring_version);
+
+-- matches v2.0
+CREATE INDEX idx_matches_couple ON matches(status) WHERE status = 'couple';
+CREATE INDEX idx_matches_last_message ON matches(last_message_at DESC);
+
+-- couples
+CREATE INDEX idx_couples_user_a ON couples(user_a_id);
+CREATE INDEX idx_couples_user_b ON couples(user_b_id);
+CREATE INDEX idx_couples_status ON couples(status) WHERE status = 'active';
+
+-- couple_rituals
+CREATE INDEX idx_rituals_couple_scheduled ON couple_rituals(couple_id, scheduled_for);
+CREATE INDEX idx_rituals_pending ON couple_rituals(couple_id, completed_at) WHERE completed_at IS NULL;
+
+-- couple_journal_entries
+CREATE INDEX idx_journal_couple ON couple_journal_entries(couple_id, created_at DESC);
+CREATE INDEX idx_journal_author ON couple_journal_entries(author_id);
+
+-- couple_check_ins
+CREATE INDEX idx_checkins_couple_date ON couple_check_ins(couple_id, check_in_date DESC);
+
+-- couple_credits
+CREATE INDEX idx_credits_couple ON couple_credits(couple_id, created_at DESC);
+
+-- couple_insights
+CREATE INDEX idx_insights_couple ON couple_insights(couple_id, period_month DESC);
+
+-- push_tokens
+CREATE INDEX idx_push_tokens_user ON push_tokens(user_id);
+
+-- notification_log
+CREATE INDEX idx_notif_log_user ON notification_log(user_id, sent_at DESC);
+CREATE INDEX idx_notif_log_status ON notification_log(status) WHERE status = 'sent';
+
+
+-- ============================================================
+-- 8. RLS FOR NEW TABLES
+-- ============================================================
+
+-- couples
+ALTER TABLE couples ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "couples_select" ON couples FOR SELECT TO authenticated
+  USING (user_a_id = auth.uid() OR user_b_id = auth.uid());
+
+-- ritual_library (public read — curated content, no user data)
+ALTER TABLE ritual_library ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "ritual_library_select" ON ritual_library FOR SELECT TO authenticated
+  USING (is_active = true);
+
+-- ritual_library_used
+ALTER TABLE ritual_library_used ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "ritual_library_used_select" ON ritual_library_used FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- couple_rituals
+ALTER TABLE couple_rituals ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "couple_rituals_select" ON couple_rituals FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+CREATE POLICY "couple_rituals_update_complete" ON couple_rituals FOR UPDATE TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  )
+  WITH CHECK (completed_by = auth.uid());
+
+-- couple_journal_entries
+ALTER TABLE couple_journal_entries ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "journal_select" ON couple_journal_entries FOR SELECT TO authenticated
+  USING (
+    author_id = auth.uid()
+    OR (
+      is_shared = true
+      AND couple_id IN (
+        SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+      )
+    )
+  );
+CREATE POLICY "journal_insert" ON couple_journal_entries FOR INSERT TO authenticated
+  WITH CHECK (author_id = auth.uid());
+CREATE POLICY "journal_update" ON couple_journal_entries FOR UPDATE TO authenticated
+  USING (author_id = auth.uid());
+
+-- couple_timeline_events
+ALTER TABLE couple_timeline_events ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "timeline_select" ON couple_timeline_events FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+CREATE POLICY "timeline_insert" ON couple_timeline_events FOR INSERT TO authenticated
+  WITH CHECK (
+    created_by = auth.uid()
+    AND couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- couple_check_ins
+ALTER TABLE couple_check_ins ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "checkins_select" ON couple_check_ins FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+CREATE POLICY "checkins_insert" ON couple_check_ins FOR INSERT TO authenticated
+  WITH CHECK (user_id = auth.uid());
+
+-- couple_challenges
+ALTER TABLE couple_challenges ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "challenges_select" ON couple_challenges FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- couple_credits
+ALTER TABLE couple_credits ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "credits_select" ON couple_credits FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- couple_badges
+ALTER TABLE couple_badges ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "badges_select" ON couple_badges FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- couple_insights
+ALTER TABLE couple_insights ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "insights_select" ON couple_insights FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+
+-- push_tokens
+ALTER TABLE push_tokens ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "push_tokens_select" ON push_tokens FOR SELECT TO authenticated
+  USING (user_id = auth.uid());
+CREATE POLICY "push_tokens_insert" ON push_tokens FOR INSERT TO authenticated
+  WITH CHECK (user_id = auth.uid());
+CREATE POLICY "push_tokens_delete" ON push_tokens FOR DELETE TO authenticated
+  USING (user_id = auth.uid());
+
+-- notification_preferences
+ALTER TABLE notification_preferences ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "notif_prefs_all" ON notification_preferences FOR ALL TO authenticated
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- notification_log (read own; Edge Function writes)
+ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "notif_log_select" ON notification_log FOR SELECT TO authenticated
+  USING (user_id = auth.uid());
+
+-- feature_config (public read — no user data)
+ALTER TABLE feature_config ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "feature_config_select" ON feature_config FOR SELECT TO authenticated
+  USING (true);
+
+
+-- ============================================================
+-- 9. UPDATED SEED DATA: compatibility_weights v2.0
+-- Block 3 weights changed:
+--   OLD: MBTI 30%, Politics 25%, Religion 25%, Situation 20%
+--   NEW: Attachment Style 25%, Politics 20%, Religion 20%, Situation 20%, MBTI 15%
+-- Relationship type promoted from penalty to Phase 1 filter
+-- ============================================================
+
+-- Update Block 3 weights
+UPDATE compatibility_weights SET
+  weight = 0.150,
+  description = 'MBTI type pairing (complementary/equal/neutral/friction) — reduced from 0.30 in v2.0'
+WHERE category = 'values' AND field_name = 'mbti_compatibility';
+
+UPDATE compatibility_weights SET
+  weight = 0.200,
+  description = 'Political alignment + cross-dating tolerance — reduced from 0.25 in v2.0'
+WHERE category = 'values' AND field_name = 'politics_match';
+
+UPDATE compatibility_weights SET
+  weight = 0.200,
+  description = 'Religious alignment + tolerance — reduced from 0.25 in v2.0'
+WHERE category = 'values' AND field_name = 'religion_match';
+
+-- Add Attachment Style (new sub-field in Block 3)
+INSERT INTO compatibility_weights (category, field_name, weight, description) VALUES
+  ('values', 'attachment_style_match', 0.250,
+   'Attachment style compatibility matrix (secure/anxious/avoidant/fearful_avoidant) — new in v2.0');
+
+-- Update relationship_type from penalty to filter
+UPDATE compatibility_weights SET
+  category = '_filter',
+  is_filter = true,
+  description = 'FILTER (v2.0): Incompatible relationship intentions are eliminated before scoring. Was a Phase 2 penalty in v1.'
+WHERE category = '_penalty' AND field_name = 'relationship_type_mismatch';
+
+-- Add scoring_version to seed context
+INSERT INTO matching_config (key, value, description) VALUES
+  ('scoring_version', '"2.0"',
+   'Current algorithm version. Stored with each compatibility_scores row to allow selective invalidation.');
+
+
+-- ============================================================
+-- 10. FEATURE CONFIG SEED DATA
+-- ============================================================
+
+INSERT INTO feature_config (feature_key, free_limit, premium_limit, unit, description) VALUES
+  ('dating_likes_per_day',        10,    NULL, 'per_day',   'Likes per day in Dating Mode'),
+  ('dating_super_likes_per_day',   1,       5, 'per_day',   'Super likes per day in Dating Mode'),
+  ('dating_rewinds_per_day',       1,    NULL, 'per_day',   'Undo last swipe (rewind)'),
+  ('couple_rituals_ai_per_month',  4,    NULL, 'per_month', 'AI-generated rituals per month'),
+  ('couple_insights_per_month',    1,       4, 'per_month', 'Monthly AI relationship insights'),
+  ('couple_journal_private',       5,    NULL, 'count',     'Max private journal entries (free tier)'),
+  ('couple_challenges_active',     1,       3, 'count',     'Max simultaneous active challenges'),
+  ('chat_ice_breakers_per_match',  3,       9, 'count',     'Ice-breakers per match');
+
+
+-- ============================================================
+-- 11. pg_cron DATA RETENTION JOBS
+-- (Requires pg_cron extension enabled in Supabase project)
+-- ============================================================
+
+-- Delete soft-deleted accounts after 30 days
+SELECT cron.schedule(
+  'delete-soft-deleted-accounts',
+  '0 3 * * *',
+  $$DELETE FROM profiles WHERE deleted_at IS NOT NULL AND deleted_at < now() - interval '30 days'$$
+);
+
+-- Delete messages from unmatched chats after 90 days
+SELECT cron.schedule(
+  'delete-old-unmatched-messages',
+  '0 4 * * *',
+  $$DELETE FROM messages
+    WHERE match_id IN (SELECT id FROM matches WHERE status = 'unmatched')
+    AND created_at < now() - interval '90 days'$$
+);
+
+-- Delete stale 3x-passed swipe records after 1 year
+SELECT cron.schedule(
+  'cleanup-old-swipes',
+  '0 5 * * 0',
+  $$DELETE FROM swipe_actions
+    WHERE action = 'pass'
+    AND pass_count >= 3
+    AND created_at < now() - interval '365 days'$$
+);
+
+-- Purge notification log after 60 days
+SELECT cron.schedule(
+  'purge-notification-log',
+  '0 6 * * *',
+  $$DELETE FROM notification_log WHERE created_at < now() - interval '60 days'$$
+);
+
+-- Auto-archive stale matches (never messaged after 30 days)
+SELECT cron.schedule(
+  'auto-archive-never-messaged',
+  '0 2 * * *',
+  $$UPDATE matches
+    SET status = 'archived'
+    WHERE status = 'active'
+    AND last_message_at IS NULL
+    AND created_at < now() - interval '30 days'$$
+);
+
+-- Auto-archive inactive matches (no messages for 60 days)
+SELECT cron.schedule(
+  'auto-archive-inactive-matches',
+  '30 2 * * *',
+  $$UPDATE matches
+    SET status = 'archived'
+    WHERE status = 'active'
+    AND last_message_at < now() - interval '60 days'$$
+);
+
+-- Purge ended couple data after 90 days
+SELECT cron.schedule(
+  'purge-ended-couples',
+  '0 7 * * 0',
+  $$DELETE FROM couples WHERE status = 'ended' AND ended_at < now() - interval '90 days'$$
+);
+
+-- ============================================================
+-- END OF v2.0 ADDITIONS
+-- ============================================================
