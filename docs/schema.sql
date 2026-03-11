@@ -2087,3 +2087,487 @@ SELECT cron.schedule(
 -- ============================================================
 -- END OF v2.0 ADDITIONS
 -- ============================================================
+
+
+-- ############################################################
+-- ############################################################
+--
+-- v2.1 ADDITIONS — Product Logic Addendum (March 2026)
+--
+-- Source: Product Logic Addendum (Alix Liasse, March 2026)
+-- Approved by: CEO (Dércio da Barca)
+--
+-- Changes:
+--   1. New enums: journal_mood_type, milestone_type, paywall_trigger_type
+--   2. ALTER couples: remove current_level, add streak pause/protection
+--   3. ALTER couple_journal_entries: private-only, new mood, remove shared
+--   4. ALTER couple_rituals: add 3-section format, weekly-only
+--   5. New tables: couple_milestones, couple_progression,
+--      paywall_events, journal_prompts
+--   6. Updated RLS: journal author-only
+--   7. Updated feature_config seed data
+--   8. New indexes
+--   9. New pg_cron jobs (streak, milestones)
+--
+-- ############################################################
+-- ############################################################
+
+
+-- ============================================================
+-- 1. NEW ENUMS (v2.1)
+-- ============================================================
+
+-- Journal mood — 5 states, one tap
+CREATE TYPE journal_mood_type AS ENUM (
+  'exhausted',   -- 😴
+  'tense',       -- 😤
+  'ok',          -- 😐
+  'good',        -- 🙂
+  'great'        -- ✨
+);
+
+-- Couple milestone types
+CREATE TYPE milestone_type AS ENUM (
+  '4_weeks',
+  '3_months',
+  '6_months',
+  '1_year'
+);
+
+-- Paywall trigger types (11 defined moments)
+CREATE TYPE paywall_trigger_type AS ENUM (
+  'journal_limit',
+  'timeline_limit',
+  'extra_ritual',
+  'credits_low',
+  'streak_protection',
+  'challenge_unlock',
+  'ai_journal_prompt',
+  'streak_week_25',
+  'milestone_3_months',
+  'milestone_challenge',
+  'partner_premium'
+);
+
+
+-- ============================================================
+-- 2. ALTER TABLE — couples (v2.1)
+-- Remove level system, add weekly streak with pause behavior
+-- ============================================================
+
+-- Level system removed — replaced by milestones (celebrations, not ratings)
+-- Note: if column existed in Part B changes schema, drop it here
+-- ALTER TABLE couples DROP COLUMN IF EXISTS current_level;
+
+-- Add streak pause/protection fields
+ALTER TABLE couples
+  ADD COLUMN IF NOT EXISTS streak_paused_at       TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS streak_protection_used TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS streak_recovered_at    TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS notification_day       SMALLINT DEFAULT 0
+    CHECK (notification_day BETWEEN 0 AND 6);
+    -- 0 = Sunday, 1 = Monday... Couple sets at onboarding.
+
+-- current_streak semantics change:
+--   BEFORE: counted consecutive DAYS of ritual completion
+--   NOW: counts consecutive WEEKS with ritual completed by BOTH partners
+-- The column type (SMALLINT/INT) remains the same. Logic changes in Edge Functions.
+
+
+-- ============================================================
+-- 3. ALTER TABLE — couple_journal_entries (v2.1)
+-- Journal is ALWAYS private. Partner NEVER sees entries.
+-- ============================================================
+
+-- Remove sharing column — journal is individual only, no shared journal
+ALTER TABLE couple_journal_entries DROP COLUMN IF EXISTS is_shared;
+
+-- Remove title — journal is mood + text, not a traditional diary
+ALTER TABLE couple_journal_entries DROP COLUMN IF EXISTS title;
+
+-- Remove tags — not used in new model
+ALTER TABLE couple_journal_entries DROP COLUMN IF EXISTS tags;
+
+-- Remove updated_at — entries are not editable
+ALTER TABLE couple_journal_entries DROP COLUMN IF EXISTS updated_at;
+
+-- Replace old mood (joyful/grateful/conflicted/sad/hopeful/neutral)
+-- with new 5-state mood (exhausted/tense/ok/good/great)
+ALTER TABLE couple_journal_entries DROP COLUMN IF EXISTS mood;
+ALTER TABLE couple_journal_entries
+  ADD COLUMN mood journal_mood_type NOT NULL DEFAULT 'ok';
+
+-- Rename content to free_text and make optional
+-- (mood selector is required, text is optional)
+ALTER TABLE couple_journal_entries RENAME COLUMN content TO free_text;
+ALTER TABLE couple_journal_entries ALTER COLUMN free_text DROP NOT NULL;
+
+-- Add prompt week (1-12) — which rotating prompt was shown
+ALTER TABLE couple_journal_entries
+  ADD COLUMN IF NOT EXISTS prompt_week SMALLINT
+    CHECK (prompt_week BETWEEN 1 AND 12);
+
+-- Add ISO week number — links journal entry to that week's ritual
+ALTER TABLE couple_journal_entries
+  ADD COLUMN IF NOT EXISTS week_number INT;
+
+
+-- ============================================================
+-- 4. ALTER TABLE — couple_rituals (v2.1)
+-- Add 3-section format: Insight + Practice + Reflection Question
+-- Weekly only (no daily rituals)
+-- ============================================================
+
+-- Add 3-section fields
+ALTER TABLE couple_rituals
+  ADD COLUMN IF NOT EXISTS insight             TEXT,
+  ADD COLUMN IF NOT EXISTS practice            TEXT,
+  ADD COLUMN IF NOT EXISTS reflection_question TEXT;
+
+-- Add week number for journal linkage
+ALTER TABLE couple_rituals
+  ADD COLUMN IF NOT EXISTS week_number INT;
+
+-- Add per-partner completion tracking (both must complete)
+ALTER TABLE couple_rituals
+  ADD COLUMN IF NOT EXISTS completed_a_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS completed_b_at TIMESTAMPTZ;
+
+-- Store partner moods at generation time (for audit/traceability)
+ALTER TABLE couple_rituals
+  ADD COLUMN IF NOT EXISTS journal_mood_a journal_mood_type,
+  ADD COLUMN IF NOT EXISTS journal_mood_b journal_mood_type;
+
+-- AI model/prompt version used for generation
+ALTER TABLE couple_rituals
+  ADD COLUMN IF NOT EXISTS ai_version TEXT;
+
+-- One ritual per couple per week
+-- (Use DO block to avoid error if constraint already exists)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'unique_couple_ritual_week'
+  ) THEN
+    ALTER TABLE couple_rituals
+      ADD CONSTRAINT unique_couple_ritual_week UNIQUE (couple_id, week_number);
+  END IF;
+END $$;
+
+-- Update ritual_type to remove 'daily' — rituals are WEEKLY only now
+ALTER TABLE couple_rituals DROP CONSTRAINT IF EXISTS couple_rituals_ritual_type_check;
+ALTER TABLE couple_rituals
+  ADD CONSTRAINT couple_rituals_ritual_type_check
+  CHECK (ritual_type IN ('weekly', 'special'));
+
+
+-- ============================================================
+-- 5. NEW TABLES (v2.1)
+-- ============================================================
+
+-- ----- 5a. couple_milestones -----
+-- Milestones are celebrations, NOT ratings. They never block features.
+-- Triggered by consecutive weeks of ritual completion by both partners.
+CREATE TABLE couple_milestones (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id       UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  milestone       milestone_type NOT NULL,
+  weeks_required  SMALLINT NOT NULL,
+  reached_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  celebrated_at   TIMESTAMPTZ,   -- when couple saw the celebration screen
+  is_premium_only BOOLEAN NOT NULL DEFAULT false,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (couple_id, milestone)
+);
+
+-- Milestone definitions:
+-- 4_weeks:  4 consecutive weeks, both completed ritual.  Free + Premium.
+--           "One month of showing up."
+-- 3_months: 12 consecutive weeks.  Free + Premium.
+--           AI-generated ritual reflecting the 12-week journey.
+-- 6_months: 26 consecutive weeks.  Premium only.
+--           Monthly retrospective — patterns, rituals, growth moments.
+-- 1_year:   52 consecutive weeks.  Premium only.
+--           Personalised anniversary ritual from full year of data.
+
+
+-- ----- 5b. couple_progression -----
+-- Weekly progression points. Points accumulate for milestones and analytics.
+CREATE TABLE couple_progression (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  couple_id   UUID NOT NULL REFERENCES couples(id) ON DELETE CASCADE,
+  week_number INT NOT NULL,
+  action      TEXT NOT NULL CHECK (action IN (
+    'ritual_completed_both',     -- 50 pts
+    'ritual_completed_one',      -- 25 pts
+    'reflection_answered_both',  -- 20 pts
+    'journal_entry_a',           -- 20 pts
+    'journal_entry_b',           -- 20 pts
+    'challenge_completed'        -- 10 pts
+  )),
+  points      SMALLINT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Point rules:
+-- ritual_completed_both:     50 pts — BOTH partners must complete
+-- ritual_completed_one:      25 pts — only ONE partner completed
+-- reflection_answered_both:  20 pts — BOTH must respond to reflection question
+-- journal_entry_a/b:         20 pts each — per partner per week (max 40/week)
+-- challenge_completed:       10 pts — bonus, does not gate progression
+
+
+-- ----- 5c. paywall_events -----
+-- Tracks every paywall trigger shown to the user. For conversion analytics.
+CREATE TABLE paywall_events (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  couple_id    UUID REFERENCES couples(id) ON DELETE SET NULL,
+  trigger_type paywall_trigger_type NOT NULL,
+  context      JSONB,         -- contextual data (e.g. streak_week, milestone)
+  presented_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  converted_at TIMESTAMPTZ,   -- if user converted at this moment
+  dismissed_at TIMESTAMPTZ    -- if user dismissed
+);
+
+-- The 11 paywall triggers:
+--  1. journal_limit       — 30 entries reached
+--  2. timeline_limit      — 10 events reached
+--  3. extra_ritual        — requested extra ritual in same week
+--  4. credits_low         — balance <= 2
+--  5. streak_protection   — tried to protect streak (highest investment)
+--  6. challenge_unlock    — premium-only challenge
+--  7. ai_journal_prompt   — tapped AI-personalised prompt
+--  8. streak_week_25      — celebration moment at 25 weeks
+--  9. milestone_3_months  — 3-month milestone reached
+-- 10. milestone_challenge — milestone challenge completed
+-- 11. partner_premium     — partner already upgraded
+
+
+-- ----- 5d. journal_prompts -----
+-- Rotating prompt library (12 weeks). Weeks 1-6 neutral, 7/10/12 vulnerable.
+CREATE TABLE journal_prompts (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  week_number   SMALLINT NOT NULL UNIQUE CHECK (week_number BETWEEN 1 AND 12),
+  prompt_text   TEXT NOT NULL,
+  is_vulnerable BOOLEAN NOT NULL DEFAULT false,
+  is_active     BOOLEAN NOT NULL DEFAULT true,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Seed: 12 rotating prompts
+INSERT INTO journal_prompts (week_number, prompt_text, is_vulnerable) VALUES
+  (1,  'What has been taking up most of your headspace this week?', false),
+  (2,  'How are you arriving to this ritual — present or distracted?', false),
+  (3,  'Is there something you didn''t say but wanted to?', false),
+  (4,  'What do you need most this week — space or closeness?', false),
+  (5,  'How do you feel about the two of you right now?', false),
+  (6,  'What gave you energy this week? What took it away?', false),
+  (7,  'Is there something your partner doesn''t know you''re feeling?', true),
+  (8,  'One word about your day?', false),
+  (9,  'What do you want to bring to this ritual today?', false),
+  (10, 'Is there anything you want AURO to know before we begin?', true),
+  (11, 'How do you feel about the week ahead?', false),
+  (12, 'Something small you''d like your partner to know?', true);
+
+-- Prompt sequence rules:
+--   Weeks 1-6: neutral prompts. User is building trust with the product.
+--   Weeks 7, 10, 12 (is_vulnerable = true): more vulnerable. Only after consistency.
+--   After week 12: sequence repeats. Library can be expanded over time.
+
+
+-- ============================================================
+-- 6. RLS FOR NEW TABLES + UPDATED POLICIES (v2.1)
+-- ============================================================
+
+-- ----- Journal: ALWAYS private (updated policy) -----
+-- Remove old policy that allowed shared reading
+DROP POLICY IF EXISTS "journal_select" ON couple_journal_entries;
+DROP POLICY IF EXISTS "journal_insert" ON couple_journal_entries;
+DROP POLICY IF EXISTS "journal_update" ON couple_journal_entries;
+
+-- New: ONLY the author can read their own entries
+-- Partner NEVER sees. AI extracts themes via Edge Function (service_role).
+CREATE POLICY "journal_select_author_only"
+  ON couple_journal_entries FOR SELECT TO authenticated
+  USING (author_id = auth.uid());
+
+-- INSERT: only own entries
+CREATE POLICY "journal_insert_own"
+  ON couple_journal_entries FOR INSERT TO authenticated
+  WITH CHECK (author_id = auth.uid());
+
+-- No UPDATE policy = blocked by RLS. Journal entries are not editable.
+-- No DELETE policy = blocked by RLS. Only service_role can delete.
+
+-- Privacy model:
+--   User sees:     their own journal entries (history)
+--   Partner sees:  NOTHING. Never. Not text, not mood, not even that entry exists.
+--   AI sees:       text + mood from BOTH via service_role → extracts THEMES only
+--   AURO team:     aggregated, anonymised data only. Never individual entries.
+
+
+-- ----- couple_milestones -----
+ALTER TABLE couple_milestones ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "milestones_select" ON couple_milestones
+  FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+-- INSERT/UPDATE: service_role only (Edge Functions check milestones)
+
+-- ----- couple_progression -----
+ALTER TABLE couple_progression ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "progression_select" ON couple_progression
+  FOR SELECT TO authenticated
+  USING (
+    couple_id IN (
+      SELECT id FROM couples WHERE user_a_id = auth.uid() OR user_b_id = auth.uid()
+    )
+  );
+-- INSERT: service_role only (Edge Functions track progression)
+
+-- ----- paywall_events -----
+ALTER TABLE paywall_events ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "paywall_select_own" ON paywall_events
+  FOR SELECT TO authenticated
+  USING (user_id = auth.uid());
+CREATE POLICY "paywall_insert_own" ON paywall_events
+  FOR INSERT TO authenticated
+  WITH CHECK (user_id = auth.uid());
+
+-- ----- journal_prompts (public read — curated content, no user data) -----
+ALTER TABLE journal_prompts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "journal_prompts_select" ON journal_prompts
+  FOR SELECT TO authenticated
+  USING (is_active = true);
+
+
+-- ============================================================
+-- 7. UPDATED FEATURE_CONFIG SEED DATA (v2.1)
+-- ============================================================
+
+-- New entries for Product Logic Addendum
+INSERT INTO feature_config (feature_key, free_limit, premium_limit, unit, description) VALUES
+  -- Journal
+  ('couple_journal_entries',     30,    NULL, 'count',     'Max journal entries (free tier). Unlimited for premium.'),
+  ('couple_journal_ai_prompts',   0,    NULL, 'per_week',  'AI-personalised journal prompts. Free = standard rotating only.'),
+  ('couple_journal_history',     30,    NULL, 'count',     'Visible journal history. Free = last 30. Premium = full + patterns.'),
+  -- Timeline
+  ('couple_timeline_events',     10,    NULL, 'count',     'Max timeline events (free tier). Unlimited for premium.'),
+  -- Streak
+  ('couple_streak_protection',    0,       1, 'per_month', 'Grace weeks per month. Free = 0. Premium = 1.'),
+  ('couple_streak_recovery',      0,       1, 'count',     'Streak recovery within 48h. Free = no. Premium = yes.'),
+  ('couple_streak_insights',      0,    NULL, 'boolean',   'Streak pattern insights. Premium only.'),
+  -- Milestones
+  ('couple_milestone_extended',   0,    NULL, 'boolean',   '6-month + 1-year milestones with AI retrospective. Premium only.'),
+  -- Rituals
+  ('couple_ritual_extra',         0,    NULL, 'per_week',  'Extra on-demand rituals beyond 1/week. Premium only.'),
+  -- Insights
+  ('couple_weekly_insight_full',  0,    NULL, 'boolean',   'Full weekly insight. Free = first sentence teaser only.')
+ON CONFLICT (feature_key) DO NOTHING;
+
+-- Update existing entries that changed
+UPDATE feature_config
+SET free_limit = 30,
+    unit = 'count',
+    description = 'Max private journal entries (free tier) — updated from 5 to 30 per addendum'
+WHERE feature_key = 'couple_journal_private';
+
+
+-- ============================================================
+-- 8. NEW INDEXES (v2.1)
+-- ============================================================
+
+-- couple_milestones
+CREATE INDEX idx_milestones_couple ON couple_milestones(couple_id);
+
+-- couple_progression
+CREATE INDEX idx_progression_couple_week ON couple_progression(couple_id, week_number);
+
+-- couple_journal_entries — updated for new model
+DROP INDEX IF EXISTS idx_journal_shared;  -- is_shared column no longer exists
+CREATE INDEX IF NOT EXISTS idx_journal_couple_week
+  ON couple_journal_entries(couple_id, week_number);
+
+-- couple_rituals — by week_number
+CREATE INDEX IF NOT EXISTS idx_rituals_couple_week_v2
+  ON couple_rituals(couple_id, week_number);
+
+-- paywall_events — for conversion analytics
+CREATE INDEX idx_paywall_user ON paywall_events(user_id, presented_at DESC);
+CREATE INDEX idx_paywall_trigger ON paywall_events(trigger_type);
+CREATE INDEX idx_paywall_conversion
+  ON paywall_events(trigger_type, converted_at)
+  WHERE converted_at IS NOT NULL;
+
+
+-- ============================================================
+-- 9. NEW pg_cron JOBS (v2.1)
+-- ============================================================
+
+-- Process weekly streak (Sunday 23:59 UTC)
+-- Checks if each active couple completed ritual that week
+SELECT cron.schedule(
+  'process-weekly-streak',
+  '59 23 * * 0',
+  $$
+  -- Couples who completed ritual this week: increment streak
+  UPDATE couples SET
+    current_streak = current_streak + 1,
+    streak_paused_at = NULL
+  WHERE status = 'active'
+  AND id IN (
+    SELECT couple_id FROM couple_rituals
+    WHERE week_number = (EXTRACT(ISOYEAR FROM now())::int * 100
+                        + EXTRACT(WEEK FROM now())::int)
+    AND completed_a_at IS NOT NULL
+    AND completed_b_at IS NOT NULL
+  );
+  -- Note: couples who did NOT complete are handled by a separate
+  -- Edge Function that checks streak_protection eligibility.
+  -- The streak PAUSES — it never resets to zero.
+  $$
+);
+
+-- Check milestones after streak update (Monday 00:05 UTC)
+SELECT cron.schedule(
+  'check-milestones',
+  '5 0 * * 1',
+  $$
+  -- 4 weeks
+  INSERT INTO couple_milestones (couple_id, milestone, weeks_required, is_premium_only)
+  SELECT id, '4_weeks', 4, false FROM couples
+  WHERE status = 'active' AND current_streak >= 4
+  AND id NOT IN (SELECT couple_id FROM couple_milestones WHERE milestone = '4_weeks')
+  ON CONFLICT DO NOTHING;
+
+  -- 3 months (12 weeks)
+  INSERT INTO couple_milestones (couple_id, milestone, weeks_required, is_premium_only)
+  SELECT id, '3_months', 12, false FROM couples
+  WHERE status = 'active' AND current_streak >= 12
+  AND id NOT IN (SELECT couple_id FROM couple_milestones WHERE milestone = '3_months')
+  ON CONFLICT DO NOTHING;
+
+  -- 6 months (26 weeks) — premium only
+  INSERT INTO couple_milestones (couple_id, milestone, weeks_required, is_premium_only)
+  SELECT id, '6_months', 26, true FROM couples
+  WHERE status = 'active' AND current_streak >= 26
+  AND id NOT IN (SELECT couple_id FROM couple_milestones WHERE milestone = '6_months')
+  ON CONFLICT DO NOTHING;
+
+  -- 1 year (52 weeks) — premium only
+  INSERT INTO couple_milestones (couple_id, milestone, weeks_required, is_premium_only)
+  SELECT id, '1_year', 52, true FROM couples
+  WHERE status = 'active' AND current_streak >= 52
+  AND id NOT IN (SELECT couple_id FROM couple_milestones WHERE milestone = '1_year')
+  ON CONFLICT DO NOTHING;
+  $$
+);
+
+
+-- ============================================================
+-- END OF v2.1 ADDITIONS — Product Logic Addendum
+-- ============================================================

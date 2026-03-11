@@ -2,6 +2,15 @@
 **Status:** Feature nova — não existe na arquitetura atual
 **Referência:** `docs/overview.md` (menção TBD) · Auro Developer Handoff v1.0 Part B
 
+> ⚠️ **ATENÇÃO — PARTE PARCIALMENTE SUPERSEDED PELA PART F**
+> A Part F (Product Logic Addendum, Março 2026) atualiza as seguintes áreas desta Part B:
+> - **Journal**: agora é SEMPRE privado (sem `shared_with_partner`). Mood mudou para 5 estados (exhausted/tense/ok/good/great). Ver Part F §1.3.
+> - **Rituais**: agora SEMANAL apenas (sem diário). Formato de 3 seções (insight + practice + reflection_question). Ver Part F §1.4.
+> - **Streak**: agora SEMANAL, pausa em vez de resetar. Ver Part F §4.
+> - **Milestones**: `current_level` removido. Substituído por milestone celebrations. Ver Part F §1.5.
+> - **Paywall**: 11 triggers definidos. Ver Part F §1.7.
+> Para a versão mais recente, sempre consultar `changes/part-f-product-logic-addendum.md` e `docs/schema.sql` (seção v2.1).
+
 > O Modo Casal era marcado como **TBD** em toda a documentação existente. Este documento especifica a arquitetura completa do zero: schema, IA, créditos, ativação e segurança psicológica.
 
 ---
