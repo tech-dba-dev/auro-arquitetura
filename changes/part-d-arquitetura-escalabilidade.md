@@ -28,7 +28,7 @@ Stack documentada como tabela simples de tecnologias, sem separação explícita
 ```
 Backend / Database  → Supabase
 Auth                → Supabase Auth
-Geospatial          → PostGIS
+Geospatial          → lat/lng + Haversine
 Real-time Chat      → Supabase Realtime
 Compatibility       → Edge Functions
 AI Pipeline         → External LLM (TBD)  ← problema
@@ -226,7 +226,7 @@ Cruzamento entre o que o `schema.sql` já tem e o que o handoff especifica:
 
 | Índice | Status no schema.sql | Observação |
 |--------|---------------------|-----------|
-| `idx_profiles_location` (GIST) | ✅ Existe (linha 965) | Correto |
+| `idx_profiles_lat_lng` (B-tree) | ✅ Existe | Substituiu PostGIS GIST — usa bounding box + Haversine |
 | `idx_profiles_active` | ✅ Existe (linha 966) | Correto |
 | `idx_compat_scores_user_a` | ✅ Existe (linha 969) | Correto |
 | `idx_compat_scores_user_b` | ✅ Existe (linha 970) | Correto |

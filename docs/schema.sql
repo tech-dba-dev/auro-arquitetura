@@ -6,11 +6,8 @@
 -- v2.0 changes appended at the bottom of this file
 -- ============================================================
 -- Run this in Supabase SQL Editor (or via migrations)
--- Depends on: Supabase Auth (auth.users), PostGIS extension
+-- Depends on: Supabase Auth (auth.users)
 -- ============================================================
-
--- Enable PostGIS for geospatial queries (distance calculation)
-CREATE EXTENSION IF NOT EXISTS postgis;
 
 
 -- ============================================================
@@ -296,7 +293,8 @@ CREATE TABLE profiles (
   education TEXT,            -- e.g. "UCLA"
 
   -- Location (for distance-based matching)
-  location GEOGRAPHY(POINT, 4326),  -- PostGIS point (lng, lat)
+  latitude DOUBLE PRECISION,         -- GPS latitude (e.g. 37.3688)
+  longitude DOUBLE PRECISION,        -- GPS longitude (e.g. -122.0363)
   location_text TEXT,                -- Display text: "Sunnyvale, California, USA"
   location_updated_at TIMESTAMPTZ,
 
@@ -962,8 +960,10 @@ CREATE INDEX idx_compat_weights_mode ON compatibility_weights(mode);
 -- Onboarding
 CREATE INDEX idx_onboarding_complete ON onboarding_progress(is_complete);
 
--- Profile location (geospatial index)
-CREATE INDEX idx_profiles_location ON profiles USING GIST(location);
+-- Profile location (bounding box + Haversine)
+CREATE INDEX idx_profiles_latitude ON profiles(latitude);
+CREATE INDEX idx_profiles_longitude ON profiles(longitude);
+CREATE INDEX idx_profiles_lat_lng ON profiles(latitude, longitude);
 CREATE INDEX idx_profiles_active ON profiles(is_active, last_active_at DESC);
 
 -- Compatibility scores

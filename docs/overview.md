@@ -40,7 +40,7 @@ Auro operates in multiple modes, each serving a different relationship need:
 |-------|-----------|
 | Backend / Database | **Supabase** (PostgreSQL + Auth + Storage + Edge Functions + Realtime) |
 | Auth | Supabase Auth (Email/Password + Apple + Google OAuth) |
-| Geospatial | **PostGIS** extension (distance calculations) |
+| Geospatial | `latitude` + `longitude` columns with bounding box + Haversine formula (no PostGIS needed) |
 | Real-time Chat | **Supabase Realtime** (PostgreSQL LISTEN/NOTIFY) |
 | Compatibility Engine | Supabase Edge Functions (deterministic scoring, < 5ms per pair) |
 | AI Pipeline | **Claude API** (`claude-sonnet-4-6`) via Edge Functions only — deal breaker parsing, explanation generation, ice-breakers, Couple Mode rituals/insights |

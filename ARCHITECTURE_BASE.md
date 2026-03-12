@@ -805,7 +805,7 @@ ALTER TABLE profiles
 
 ```sql
 -- profiles
-CREATE INDEX idx_users_location ON profiles USING GIST(location);
+CREATE INDEX idx_profiles_lat_lng ON profiles(latitude, longitude);
 CREATE INDEX idx_users_active ON profiles(last_active_at) WHERE active = true;
 
 -- compatibility_scores / matches

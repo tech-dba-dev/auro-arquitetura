@@ -534,9 +534,10 @@ What gets sent to the client for each swipe card:
 - Only stale scores need recalculation at feed time
 - For a user with 10k potential matches, pre-calc happens in batch overnight
 
-### Geospatial
-- User location stored as PostGIS `GEOGRAPHY(POINT)` in `profiles`
-- Distance calculated with `ST_DStWithin` for fast index-based filtering
+### Distance Filtering
+- User location stored as `latitude` + `longitude` (DOUBLE PRECISION) in `profiles`
+- Distance calculated with bounding box pre-filter + Haversine formula
+- Bounding box uses indexed columns for fast elimination (handles millions of rows)
 - Location updated when app is opened (not continuous GPS drain)
 
 ### Feed caching
@@ -547,7 +548,7 @@ What gets sent to the client for each swipe card:
 ### Scaling
 - Slot allocation can run in Supabase Edge Function (< 50ms)
 - Compatibility score lookup is indexed (O(1) per pair)
-- Batch of 20 profiles = ~20 indexed lookups + 1 geospatial query
+- Batch of 20 profiles = ~20 indexed lookups + 1 bounding box + Haversine query
 
 ---
 
